@@ -70,31 +70,56 @@ class PortsStack implements Module
      */
     public function discover(OS $os): void
     {
-        $data = \SnmpQuery::enumStrings()->walk('IF-MIB::ifStackStatus');
+        // First, get stacks from the standard ifStackStatus
+        $ifStackData = \SnmpQuery::enumStrings()->walk('IF-MIB::ifStackStatus');
+        $portStacks = new \Illuminate\Support\Collection();
 
-        if (! $data->isValid()) {
-            return;
+        if ($ifStackData->isValid()) {
+            $portStacks = $ifStackData->mapTable(function ($data, $lowIfIndex, $highIfIndex = null) use ($os) {
+                if ($highIfIndex === null) {
+                    Log::debug('Skipping ' . $lowIfIndex . ' due to bad table index from the device');
+                    return null;
+                }
+
+                if ($lowIfIndex == '0' || $highIfIndex == '0') {
+                    return null; // we don't care about the default entries for ports that have stacking enabled
+                }
+
+                return new PortStack([
+                    'high_ifIndex' => $highIfIndex,
+                    'high_port_id' => PortCache::getIdFromIfIndex($highIfIndex, $os->getDevice()),
+                    'low_ifIndex' => $lowIfIndex,
+                    'low_port_id' => PortCache::getIdFromIfIndex($lowIfIndex, $os->getDevice()),
+                    'ifStackStatus' => $data['IF-MIB::ifStackStatus'],
+                ]);
+            });
         }
 
-        $portStacks = $data->mapTable(function ($data, $lowIfIndex, $highIfIndex = null) use ($os) {
-            if ($highIfIndex === null) {
-                Log::debug('Skipping ' . $lowIfIndex . ' due to bad table index from the device');
+        // Second, get stacks from the IEEE8023-LAG-MIB for devices that use it (like OCNOS)
+        $dot3adData = \SnmpQuery::walk('IEEE8023-LAG-MIB::dot3adAggPortAttachedAggID');
+        if ($dot3adData->isValid()) {
+            $dot3adStacks = new \Illuminate\Support\Collection();
+            foreach ($dot3adData->pluck() as $member_ifIndex => $aggregator_ifIndex) {
+                $port_id_low = PortCache::getIdFromIfIndex($member_ifIndex, $os->getDevice());
+                $port_id_high = PortCache::getIdFromIfIndex($aggregator_ifIndex, $os->getDevice());
 
-                return null;
+                if ($port_id_low && $port_id_high) {
+                    $dot3adStacks->push(new PortStack([
+                        'low_port_id' => $port_id_low,
+                        'high_port_id' => $port_id_high,
+                        'low_ifIndex' => $member_ifIndex,
+                        'high_ifIndex' => $aggregator_ifIndex,
+                        'device_id' => $os->getDevice()->device_id,
+                        'ifStackStatus' => 'active',
+                    ]));
+                }
             }
+            $portStacks = $portStacks->merge($dot3adStacks);
+        }
 
-            if ($lowIfIndex == '0' || $highIfIndex == '0') {
-                return null;  // we don't care about the default entries for ports that have stacking enabled
-            }
-
-            return new PortStack([
-                'high_ifIndex' => $highIfIndex,
-                'high_port_id' => PortCache::getIdFromIfIndex($highIfIndex, $os->getDevice()),
-                'low_ifIndex' => $lowIfIndex,
-                'low_port_id' => PortCache::getIdFromIfIndex($lowIfIndex, $os->getDevice()),
-                'ifStackStatus' => $data['IF-MIB::ifStackStatus'],
-            ]);
-        });
+        if ($portStacks->isEmpty()) {
+            return;
+        }
 
         ModuleModelObserver::observe(PortStack::class);
         $this->syncModels($os->getDevice(), 'portsStack', $portStacks->filter());
